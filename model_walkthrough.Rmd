@@ -1,0 +1,234 @@
+---
+title: "HackingLimnoWorkshop"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(feather)
+library(mapview)
+library(sf)
+library(xgboost)
+library(Hmisc)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+```{r}
+## Lets find a lake with lots of data.
+
+srMunged <- read_feather('data/srMunged.feather')
+
+
+okee <- srMunged %>% #filter(COMID == 166757656) %>%
+  select(parameter, blue, date, date_unity, dswe, green, nir, red, sat, swir1, swir2, timediff, pwater, value, clouds, meandepth) %>%
+  distinct(blue, red, green, nir, swir1, date, parameter, .keep_all = T)
+
+
+target <- 'secchi'
+feats <- c('blue', 'red', 'green', 'nir', 'swir1','dwl', 'meandepth') 
+
+
+modelInput <- okee %>% filter(parameter == target) %>%
+  mutate(id = row_number(),
+         dwl = fui.hue(red, blue, green),
+         BR = blue/red,
+         NR = nir/red,
+         BG = blue/green,
+         ndwi = (green-nir)/(green + nir)) %>%
+    filter(clouds < 30, 
+           timediff < 24,
+           dwl > 400, dwl < 650,
+           value < 10, value > .1)
+
+
+set.seed(2423)
+train <- modelInput %>% sample_frac(.7)
+test <- modelInput %>% filter(!id %in% train$id)
+
+dtrain <- xgb.DMatrix(data = as.matrix(train[,feats]), label = train['value'][[1]])
+dtest <- xgb.DMatrix(data = as.matrix(test[,feats]), label = test[,'value'][[1]])
+
+
+params <- list(booster = "gbtree", objective = "reg:squarederror", eval_metric = 'mae', eta=0.1, gamma=0, max_depth=3, min_child_weight=1, subsample=1, colsample_bytree=1)
+
+## Do a quick cv to check ideal number of folds
+xgbcv <- xgb.cv(params = params, data = dtrain, nrounds = 1000, nfold = 5, showsd = T, stratified = T, print_every_n = 25, early_stopping_round = 10, maximize = F)
+
+xgb.naive <- xgb.train(params = params, data = dtrain, nrounds = 1000, watchlist = list(train = dtrain, val = dtest), print_every_n = 25, early_stopping_rounds = 10, maximize = F)
+
+import <- xgb.importance(feats, xgb.naive)
+xgb.plot.importance(import)
+```
+
+#### We want our CV RMSE to roughly equal our holdout RMSE, if holdout is much lower we might be overfitting.
+
+#### `r paste0('Naive Model Hold-out RMSE = ', xgb.naive$best_score)`
+#### `r paste0('CV RMSE = ', xgbcv$evaluation_log$test_rmse_mean[xgbcv$best_iteration])`
+  
+Note: We still need to think about is how we want to portray our validation. The non-linear aspects of dominant wavelength makes it a little tricky.
+
+```{r, eval = F}
+preds <- test %>% mutate(predicted = predict(xgb.naive, dtest))
+
+ggplot(preds, aes(x = value, y = predicted)) +
+  geom_hex() +
+  scale_fill_viridis_c(trans = 'log10') +
+  geom_abline(color = 'red') +
+
+    ggpmisc::stat_poly_eq(aes(label =  paste(stat(adj.rr.label))),
+               formula = y~x, parse = TRUE, 
+               label.y = Inf, vjust = 1.3) 
+
+```
+
+## Now lets look at some interpretability metrics, first feature importance and Accumulated Local Effects (ALE) plots
+
+Here, feature importance is permutation feature importance, or the increase in error when the values of a predictor are randomly shuffled (i.e. when we add significant noise to a given predictor).  
+
+```{r}
+pred <- function(model, newdata){
+  predict(model, xgb.DMatrix(as.matrix(newdata)))
+}
+
+predictor <- iml::Predictor$new(xgb.naive, data = train[,feats], y = train[,'value'][[1]], predict.function = pred)
+
+featureImp <- iml::FeatureImp$new(predictor, loss = 'mse')
+plot(featureImp)
+effs <- iml::FeatureEffects$new(predictor)
+check <- do.call('rbind', effs$results)
+```
+
+ALE plots describe the average influence of a predictor on the final prediction along a localized window of values.  These plots are simple to interpret, fast to calculate, and aren't impacted collinearity in the predictor space.  If the ALE value is above zero, it means the feature has a positive impace on model predictions at the given value along the x-axis. If it's below 0, it has a negative impact. The distributions above each plot represent the distibution of values (5-95th percentile) we have in our training data (not sure why the plot alignment is a little off, this can be fixed down the road). 
+
+For a summary of ALE plots, see https://christophm.github.io/interpretable-ml-book/ale.html.
+
+```{r}
+alePlotter <- function(feature){
+  perc5 = quantile(train[[feature]],.04)
+  perc95 = quantile(train[[feature]],0.96)
+  
+  p1 <- ggplot(train, aes_string(x = feature)) + geom_density(adjust = 4, fill = 'grey70') +
+    xlim(perc5,perc95) + 
+    theme_classic() +
+    theme(axis.text = element_text(color = 'transparent'),
+          axis.title = element_blank(),
+          #axis.title.y = element_text(color = 'transparent'),
+          axis.ticks = element_blank(),
+          axis.line = element_line(color = 'transparent'),
+          plot.margin = margin(0,-1,-1,-1))
+  
+  #if(feature == 'dWL'){p1 = p1 + labs(tag = 'b)')}
+  
+  p2 <- check %>% filter(.feature == feature, .borders >= perc5, .borders <= perc95) %>%
+    ggplot(.,aes(x= .borders, y = .value)) +
+    geom_line() +
+    geom_point() +
+    xlim(perc5,perc95) +
+    geom_hline(aes(yintercept = 0), color = 'red')+
+    facet_wrap(~.feature) +
+    theme_bw() +
+    theme(axis.title = element_blank(),
+          plot.margin = margin(-3,0,0,0))
+  #if(feature == 'dWL'){p2 = p2 + labs(tag = 'b)')}
+  arrangeGrob(p1,p2, nrow = 2, heights = c(.3,1))
+  }
+
+
+p1 <- alePlotter(featureImp$results$feature[1])  
+p2 <- alePlotter(featureImp$results$feature[2])
+p3 <- alePlotter(featureImp$results$feature[3])
+p4 <- alePlotter(featureImp$results$feature[4])
+p5 <- alePlotter(featureImp$results$feature[5])
+p6 <- alePlotter(featureImp$results$feature[6])
+p7 <- alePlotter(featureImp$results$feature[7])
+p8 <- alePlotter(featureImp$results$feature[8])
+p9 <- alePlotter(featureImp$results$feature[9])
+p10 <- alePlotter(featureImp$results$feature[10])
+p11 <- alePlotter(featureImp$results$feature[11])
+p12 <- alePlotter(featureImp$results$feature[12])
+
+grid.arrange(p1,p2,p3,p4,p5,p6, nrow = 4, left = 'Accumulated Local Effect (nm)', bottom = 'Feature Value')
+```
+
+### Surrogate Trees can help us identify what variable splits and thresholds might be most important.
+These are similar to the results that Xiao has presented, except that they're based on the *predictions* of our machine learning model and not the actual *observed* values in our dataset.  This means that it's telling us important splits/thresholds in the model itself. Here I limit them to a depth of 2, but this is adjustable. 
+
+```{r}
+tree <- iml::TreeSurrogate$new(predictor, maxdepth = 2)
+plot(tree$tree)
+```
+
+### Finally, we'll look at SHAP (Shapely Additive exPlanations).
+These are similar to ALE plots, but show the distribution of feature effects across all observations instead of just averaged across a small window.  Additionally, they can tell us the feature contributions to any *individual* prediction.  The methods are a little more complicated, but a simplified explanation is that SHAP builds iterative local models at each of our observations. For more info, see https://christophm.github.io/interpretable-ml-book/shap.html
+
+First: we'll look at overall SHAP results for our nine most important features. For SHAP, importance is calculated as those predictors that have the highest cumulative impact across the local models.
+
+```{r}
+xgb.plot.shap(data = as.matrix(train[,feats]), top_n = 5, n_col = 3, model = xgb.naive) 
+```
+
+Then, we'll look at the SHAP summary plot for all predictors. Here, features are ordered by their SHAP importance. Each point on the summary plot is a Shapley value for a feature in one of our observations. The x-axis is it's Shapley value (it's contribution to the model prediction). The color represents the relative value of the feature from low to high.
+
+```{r}
+library(SHAPforxgboost)
+shap_long <- shap.prep(xgb_model = xgb.naive, X_train = as.matrix(train[,feats]))
+shap.plot.summary(shap_long)
+```
+
+With SHAP, we can take any individual observation and see how each input feature contributes to the final prediction as shown below for the first observation in our training dataset. Phi, along the x axis, denotes the impact of each feature to the final prediction. This allows us to look at any individual lake and see how our model is predicting its color.
+
+```{r}
+shap <- Shapley$new(predictor, x.interest = train[,feats][1,])
+plot(shap)
+
+shap$results
+
+shapper <- function(i, ID){
+  shap <- Shapley$new(predictor, x.interest = train[,feats][i,])
+  
+  shap$results %>% filter(feature %in% c('spring_temperature_mean',
+                                 'spring_total_precipitation_mean',
+                                 'depthMean')) %>%
+    mutate(id = ID)
+  # tibble(id = ID, 
+  #        temp_shap = shap$results$phi[shap$results$feature == 'spring_temperature_mean'], 
+  #        precip_shap = shap$results$phi[shap$results$feature == 'spring_total_precipitation_mean'],
+  #        depth_shap = shap$results$phi[shap$results$feature == 'depthMean']
+  #        )
+}
+
+library(furrr)
+sample <- c(1:nrow(train)) %>% sample(5000)
+plan(multiprocess)
+shapperOut = future_map2_dfr(sample, train$id[sample], shapper, .progress = T, .options = future_options(packages = c('xgboost', 'iml')))
+
+plan(sequential)
+
+
+shapperOut = map2_dfr(c(1:nrow(train)), train$id, shapper)
+
+world <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
+
+shapper.sf <- shapperOut %>% left_join(train %>% dplyr::select(id, lat, lon)) %>%
+  st_as_sf(coords = c('lon','lat'), crs = 4326)
+
+feature =  "spring_total_precipitation_mean"
+hist(shapperOut$phi[shapperOut$feature == feature])
+
+shapper.sf %>%
+  mutate(phi = ifelse(phi < -20,-20, 
+                      ifelse(phi >15,15,phi))) %>%
+  ggplot() +
+  geom_sf(data = world) +
+  geom_sf(aes(color = phi), size = .5) +
+  #scale_color_viridis_c('Model Impact') +
+  scale_color_gradient2('Model Impact', low = 'blue', mid = 'grey80', high = 'red') +
+  theme(legend.position = 'bottom') +
+  facet_wrap(~feature, ncol = 1)
+
+
+
+shapperOut = map2_dfr(c(1:10), train$id[1:10], shapper)
+```
