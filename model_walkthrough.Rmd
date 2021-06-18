@@ -13,53 +13,61 @@ library(Hmisc)
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-## R Markdown
+## First lets load in AquaSat (available at <https://figshare.com/articles/dataset/AquaSat/8139383>).  
+
+It's important to know that AquaSat takes a very *inclusive* approach to data availability.  This is in order to give end users more control over the various filtering choices they want to make.  However, it also means that we need to be careful and apply some reasonable data quality control measures. That's what we'll do in this first chunk. Future version's of AquaSat will have tiered data, basically a flag that does this step for you.
 
 ```{r}
-## Lets find a lake with lots of data.
+source('utils.R')
 
-srMunged <- read_feather('data/srMunged.feather')
-
-
-okee <- srMunged %>% #filter(COMID == 166757656) %>%
-  select(parameter, blue, date, date_unity, dswe, green, nir, red, sat, swir1, swir2, timediff, pwater, value, clouds, meandepth) %>%
-  distinct(blue, red, green, nir, swir1, date, parameter, .keep_all = T)
-
-
-target <- 'secchi'
-feats <- c('blue', 'red', 'green', 'nir', 'swir1','dwl', 'meandepth') 
-
-
-modelInput <- okee %>% filter(parameter == target) %>%
-  mutate(id = row_number(),
-         dwl = fui.hue(red, blue, green),
-         BR = blue/red,
+as <- read_csv('data/sr_wq_rs_join.csv')
+  
+as.munged <- as %>%
+  filter(!is.na(secchi),
+         type =='Lake',
+         pwater > 90,
+         pixelCount > 10,
+         clouds < 10,
+         secchi > 0,
+         secchi < 10,
+         across(c(blue, green, red, nir, swir1, swir2), ~ .x > 0 & .x < 1000)) %>%
+  select(blue, green, red, nir, swir1, swir2, sat, date, secchi, lat, long) %>%
+  mutate(dWL = fui.hue(red, green, blue),
          NR = nir/red,
-         BG = blue/green,
-         ndwi = (green-nir)/(green + nir)) %>%
-    filter(clouds < 30, 
-           timediff < 24,
-           dwl > 400, dwl < 650,
-           value < 10, value > .1)
+         ndvi = (nir-red)/(nir+red),
+         gndvi = (nir-green)/(nir + green),
+         ndti = (red-green)/(red + green),
+         id = row_number()) %>%
+  left_join(fui.lookup) %>%
+  filter(!is.na(fui))
+  
 
+sum(is.na(as.munged$fui))
+## Add some variables that we know are helpful for modelling. Specifically dominant wavelength and 
 
+```
+
+```{r}
+
+# Define our target and input variables
+target <- 'secchi'
+feats <- c('blue', 'red', 'green', 'nir', 'NR', 'gndvi', 'ndti', 'ndvi', 'dWL') 
+
+# Set aside training and testing data
 set.seed(2423)
-train <- modelInput %>% sample_frac(.7)
-test <- modelInput %>% filter(!id %in% train$id)
+train <- as.munged %>% sample_frac(.7)
+test <- as.munged %>% filter(!id %in% train$id)
 
-dtrain <- xgb.DMatrix(data = as.matrix(train[,feats]), label = train['value'][[1]])
-dtest <- xgb.DMatrix(data = as.matrix(test[,feats]), label = test[,'value'][[1]])
-
+dtrain <- xgb.DMatrix(data = as.matrix(train[,feats]), label = train[,target][[1]])
+dtest <- xgb.DMatrix(data = as.matrix(test[,feats]), label = test[,target][[1]])
 
 params <- list(booster = "gbtree", objective = "reg:squarederror", eval_metric = 'mae', eta=0.1, gamma=0, max_depth=3, min_child_weight=1, subsample=1, colsample_bytree=1)
 
 ## Do a quick cv to check ideal number of folds
-xgbcv <- xgb.cv(params = params, data = dtrain, nrounds = 1000, nfold = 5, showsd = T, stratified = T, print_every_n = 25, early_stopping_round = 10, maximize = F)
-
 xgb.naive <- xgb.train(params = params, data = dtrain, nrounds = 1000, watchlist = list(train = dtrain, val = dtest), print_every_n = 25, early_stopping_rounds = 10, maximize = F)
 
-import <- xgb.importance(feats, xgb.naive)
-xgb.plot.importance(import)
+f.import <- xgb.importance(feats, xgb.naive)
+xgb.plot.importance(f.import)
 ```
 
 #### We want our CV RMSE to roughly equal our holdout RMSE, if holdout is much lower we might be overfitting.
@@ -72,84 +80,37 @@ Note: We still need to think about is how we want to portray our validation. The
 ```{r, eval = F}
 preds <- test %>% mutate(predicted = predict(xgb.naive, dtest))
 
-ggplot(preds, aes(x = value, y = predicted)) +
+ggplot(preds, aes(x = secchi, y = predicted)) +
   geom_hex() +
   scale_fill_viridis_c(trans = 'log10') +
   geom_abline(color = 'red') +
-
-    ggpmisc::stat_poly_eq(aes(label =  paste(stat(adj.rr.label))),
+  ggpmisc::stat_poly_eq(aes(label =  paste(stat(adj.rr.label))),
                formula = y~x, parse = TRUE, 
                label.y = Inf, vjust = 1.3) 
 
 ```
+ALE plots describe the average influence of a predictor on the final prediction along a localized window of values.  These plots are simple to interpret, fast to calculate, and aren't impacted collinearity in the predictor space.  If the ALE value is above zero, it means the feature has a positive impace on model predictions at the given value along the x-axis. If it's below 0, it has a negative impact. The distributions above each plot represent the distibution of values (5-95th percentile) we have in our training data (not sure why the plot alignment is a little off, this can be fixed down the road). 
+
+For a summary of ALE plots, see https://christophm.github.io/interpretable-ml-book/ale.html.
 
 ## Now lets look at some interpretability metrics, first feature importance and Accumulated Local Effects (ALE) plots
 
 Here, feature importance is permutation feature importance, or the increase in error when the values of a predictor are randomly shuffled (i.e. when we add significant noise to a given predictor).  
 
 ```{r}
+import <- xgb.importance(feats, xgb.naive)
+xgb.plot.importance(import)
+
 pred <- function(model, newdata){
   predict(model, xgb.DMatrix(as.matrix(newdata)))
 }
 
-predictor <- iml::Predictor$new(xgb.naive, data = train[,feats], y = train[,'value'][[1]], predict.function = pred)
+predictor <- iml::Predictor$new(xgb.naive, data = as.munged[,feats], y = as.munged[,target][[1]], predict.function = pred)
 
 featureImp <- iml::FeatureImp$new(predictor, loss = 'mse')
 plot(featureImp)
 effs <- iml::FeatureEffects$new(predictor)
-check <- do.call('rbind', effs$results)
-```
-
-ALE plots describe the average influence of a predictor on the final prediction along a localized window of values.  These plots are simple to interpret, fast to calculate, and aren't impacted collinearity in the predictor space.  If the ALE value is above zero, it means the feature has a positive impace on model predictions at the given value along the x-axis. If it's below 0, it has a negative impact. The distributions above each plot represent the distibution of values (5-95th percentile) we have in our training data (not sure why the plot alignment is a little off, this can be fixed down the road). 
-
-For a summary of ALE plots, see https://christophm.github.io/interpretable-ml-book/ale.html.
-
-```{r}
-alePlotter <- function(feature){
-  perc5 = quantile(train[[feature]],.04)
-  perc95 = quantile(train[[feature]],0.96)
-  
-  p1 <- ggplot(train, aes_string(x = feature)) + geom_density(adjust = 4, fill = 'grey70') +
-    xlim(perc5,perc95) + 
-    theme_classic() +
-    theme(axis.text = element_text(color = 'transparent'),
-          axis.title = element_blank(),
-          #axis.title.y = element_text(color = 'transparent'),
-          axis.ticks = element_blank(),
-          axis.line = element_line(color = 'transparent'),
-          plot.margin = margin(0,-1,-1,-1))
-  
-  #if(feature == 'dWL'){p1 = p1 + labs(tag = 'b)')}
-  
-  p2 <- check %>% filter(.feature == feature, .borders >= perc5, .borders <= perc95) %>%
-    ggplot(.,aes(x= .borders, y = .value)) +
-    geom_line() +
-    geom_point() +
-    xlim(perc5,perc95) +
-    geom_hline(aes(yintercept = 0), color = 'red')+
-    facet_wrap(~.feature) +
-    theme_bw() +
-    theme(axis.title = element_blank(),
-          plot.margin = margin(-3,0,0,0))
-  #if(feature == 'dWL'){p2 = p2 + labs(tag = 'b)')}
-  arrangeGrob(p1,p2, nrow = 2, heights = c(.3,1))
-  }
-
-
-p1 <- alePlotter(featureImp$results$feature[1])  
-p2 <- alePlotter(featureImp$results$feature[2])
-p3 <- alePlotter(featureImp$results$feature[3])
-p4 <- alePlotter(featureImp$results$feature[4])
-p5 <- alePlotter(featureImp$results$feature[5])
-p6 <- alePlotter(featureImp$results$feature[6])
-p7 <- alePlotter(featureImp$results$feature[7])
-p8 <- alePlotter(featureImp$results$feature[8])
-p9 <- alePlotter(featureImp$results$feature[9])
-p10 <- alePlotter(featureImp$results$feature[10])
-p11 <- alePlotter(featureImp$results$feature[11])
-p12 <- alePlotter(featureImp$results$feature[12])
-
-grid.arrange(p1,p2,p3,p4,p5,p6, nrow = 4, left = 'Accumulated Local Effect (nm)', bottom = 'Feature Value')
+plot(effs)
 ```
 
 ### Surrogate Trees can help us identify what variable splits and thresholds might be most important.
@@ -166,7 +127,7 @@ These are similar to ALE plots, but show the distribution of feature effects acr
 First: we'll look at overall SHAP results for our nine most important features. For SHAP, importance is calculated as those predictors that have the highest cumulative impact across the local models.
 
 ```{r}
-xgb.plot.shap(data = as.matrix(train[,feats]), top_n = 5, n_col = 3, model = xgb.naive) 
+xgb.plot.shap(data = as.matrix(as.munged[,feats]), top_n = 6, n_col = 3, model = xgb.naive) 
 ```
 
 Then, we'll look at the SHAP summary plot for all predictors. Here, features are ordered by their SHAP importance. Each point on the summary plot is a Shapley value for a feature in one of our observations. The x-axis is it's Shapley value (it's contribution to the model prediction). The color represents the relative value of the feature from low to high.
