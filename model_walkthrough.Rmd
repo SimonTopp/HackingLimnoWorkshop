@@ -1,5 +1,6 @@
 ---
-title: "HackingLimnoWorkshop"
+title: "Hacking Limnology Workshop"
+date: "7/13/2021"
 output: html_document
 ---
 
@@ -10,20 +11,31 @@ library(mapview)
 library(sf)
 library(xgboost)
 library(Hmisc)
-knitr::opts_chunk$set(echo = TRUE)
+library(leaflet)
+library(leafgl)
+library(kableExtra)
+library(Metrics)
+library(lubridate)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 ```
 
-## First lets load in AquaSat (available at <https://figshare.com/articles/dataset/AquaSat/8139383>).  
+### First lets load in AquaSat (available at <https://figshare.com/articles/dataset/AquaSat/8139383>).  
 
 It's important to know that AquaSat takes a very *inclusive* approach to data availability.  This is in order to give end users more control over the various filtering choices they want to make.  However, it also means that we need to be careful and apply some reasonable data quality control measures. That's what we'll do in this first chunk. Future version's of AquaSat will have tiered data, basically a flag that does this step for you.
 
+Additionally, we'll add some band ratios that we know will be helpful in our modelling efforts.
+
 ```{r}
+## Bring in some utility functions that we'll use throughout the tutorial.
 source('utils.R')
 
+## Read in AquaSat
 as <- read_csv('data/sr_wq_rs_join.csv')
-  
+
+## Do some QC and filter the data to just water clarity in lakes.  
 as.munged <- as %>%
-  filter(!is.na(secchi),
+  filter(!is.na(secchi), 
          type =='Lake',
          pwater > 90,
          pixelCount > 10,
@@ -40,12 +52,11 @@ as.munged <- as %>%
          id = row_number()) %>%
   left_join(fui.lookup) %>%
   filter(!is.na(fui))
-  
-
-sum(is.na(as.munged$fui))
-## Add some variables that we know are helpful for modelling. Specifically dominant wavelength and 
-
 ```
+
+### Build a model to predict water clarity.
+
+Now we're going to use AquaSat to build a model for predicting water clarity in lakes. Here, we're going to build what I'll refer to as a *naive* model.  By naive I am referring to the fact that it's a proof of concept model and there are a number of steps we could take to improve it's performance and generalizability.  We'll discuss some of these below.
 
 ```{r}
 
@@ -58,26 +69,15 @@ set.seed(2423)
 train <- as.munged %>% sample_frac(.7)
 test <- as.munged %>% filter(!id %in% train$id)
 
-dtrain <- xgb.DMatrix(data = as.matrix(train[,feats]), label = train[,target][[1]])
-dtest <- xgb.DMatrix(data = as.matrix(test[,feats]), label = test[,target][[1]])
+dtrain <- xgb.DMatrix(data = as.matrix(train[feats]), label = train[target][[1]])
+dtest <- xgb.DMatrix(data = as.matrix(test[feats]), label = test[target][[1]])
 
+# Set our parameters, note that we won't be hypertuning our model for this example.
 params <- list(booster = "gbtree", objective = "reg:squarederror", eval_metric = 'mae', eta=0.1, gamma=0, max_depth=3, min_child_weight=1, subsample=1, colsample_bytree=1)
 
-## Do a quick cv to check ideal number of folds
+## Train our model with early stopping rounds on our test data to avoid overfitting.
 xgb.naive <- xgb.train(params = params, data = dtrain, nrounds = 1000, watchlist = list(train = dtrain, val = dtest), print_every_n = 25, early_stopping_rounds = 10, maximize = F)
 
-f.import <- xgb.importance(feats, xgb.naive)
-xgb.plot.importance(f.import)
-```
-
-#### We want our CV RMSE to roughly equal our holdout RMSE, if holdout is much lower we might be overfitting.
-
-#### `r paste0('Naive Model Hold-out RMSE = ', xgb.naive$best_score)`
-#### `r paste0('CV RMSE = ', xgbcv$evaluation_log$test_rmse_mean[xgbcv$best_iteration])`
-  
-Note: We still need to think about is how we want to portray our validation. The non-linear aspects of dominant wavelength makes it a little tricky.
-
-```{r, eval = F}
 preds <- test %>% mutate(predicted = predict(xgb.naive, dtest))
 
 ggplot(preds, aes(x = secchi, y = predicted)) +
@@ -88,14 +88,159 @@ ggplot(preds, aes(x = secchi, y = predicted)) +
                formula = y~x, parse = TRUE, 
                label.y = Inf, vjust = 1.3) 
 
+preds %>%
+  summarise(rmse = rmse(secchi, predicted),
+            mae = mae(secchi, predicted),
+            mape = mape(secchi, predicted),
+            bias = bias(secchi, predicted),
+            p.bias = percent_bias(secchi, predicted),
+            smape = smape(secchi, predicted)) %>% 
+  kable(digits = 3) %>% kable_styling()
 ```
-ALE plots describe the average influence of a predictor on the final prediction along a localized window of values.  These plots are simple to interpret, fast to calculate, and aren't impacted collinearity in the predictor space.  If the ALE value is above zero, it means the feature has a positive impace on model predictions at the given value along the x-axis. If it's below 0, it has a negative impact. The distributions above each plot represent the distibution of values (5-95th percentile) we have in our training data (not sure why the plot alignment is a little off, this can be fixed down the road). 
+#### So, using purely optical inputs, we still get an R^2 of ~.5 and MAE of `r round(xgb.naive$best_score, 3)` meters. Not bad!
+#### If we wanted to maximize this models predictive capability we could:
+- Add in lake and landscape variables (depth, surface area, land cover, etc)
+- Apply some minor standardization procedures across our landsat sensors
+- Hypertune our model to optimize performance.
+
+#### If we wanted to maximize the generalizability of our model we could:
+- Apply leave-location-leave time out cross-validation
+- Be more intential in terms of our train/test splits
+- Apply model weights to focus on data sparse regions
+
+### Now lets actually apply our model to a lake to explore it's clarity dynamics.  
+Here, were going to use lake Mendota as an example, but the map below shows all the lakes that are in LimnoSat-US.
+
+```{r}
+## Read in the data
+# Lakes
+lakes <- st_read('../Walkthroughs/data/LimnoSat/HydroLakes_DP.shp') %>%
+  st_centroid()
+
+#LimnoSat
+ls <- read_feather('../Walkthroughs/data/LimnoSat/LimnoSat_20200628.feather')
+
+#Find your lake of interest, click on the a lake to get it's Hylak_id
+leaflet() %>%
+  addTiles() %>%
+  addGlPoints(lakes %>% filter(type == 'dp'), popup = 'Hylak_id')
+
+```
+
+#### First just look at the distribution of observations that we have for it
+
+```{r Mendota Explorer}
+# Filter to Mendota and add some useful variables
+#Mendota <- ls %>% filter(Hylak_id == 9086)
+Mendota <- read_csv('data/LimnoSat_Mendota.csv') %>%
+  mutate(month = month(date, label = T),
+         doy = yday(date),
+         period = cut(year, 12, dig.lab = 4))
+
+# Yearly observations
+ggplot(Mendota, aes(x = year)) + geom_bar() + labs(y = 'Number of Observations', title = 'Yearly Observations') + theme_bw()
+
+# Monthly observations
+Mendota %>% mutate(month = month(date, label = T)) %>%
+  ggplot(., aes(x = month)) + geom_bar() + labs(y = 'Number of Observations', title = 'Monthly Observations') + theme_bw()
+```
+
+### For Mendota, looks like we have a total of `r nrow(Mendota)` observations. LimnoSat-US contains all the Landsat Reflectance values as well as the dominant wavelength, a metric of color. We'll use dominant wavelength to explore the data because it's an intuitive way to examine lake systems.
+
+```{r}
+Mendota <- Mendota %>% left_join(fui.lookup) 
+
+# Overall Color Distribution
+Mendota %>% group_by(dWL) %>%
+  summarise(count = n()) %>%
+  left_join(fui.lookup) %>%
+  ggplot(., aes(x = dWL, y = count, fill = color.code)) + 
+  geom_col() +
+  scale_fill_identity() +
+  labs(x = 'Wavelength (nm)', title = 'Overall Color Distribution') +
+  theme_bw() +
+  theme(legend.position = 'none')
+
+# Monthly Climatology
+ggplot(Mendota, aes(x = month, y = dWL)) + 
+  #geom_violin(draw_quantiles = .5) +
+  geom_boxplot(outlier.colour = 'transparent') +
+  geom_jitter(aes(color = color.code), size = 2, position = position_jitter(.2)) +
+  scale_color_identity() +
+  labs(y = 'Wavelength (nm)', title = 'Monthly Climatology') +
+  theme_bw() +
+  theme(legend.position = 'none')
+
+# Summer color observations over time
+Mendota %>%
+  filter(month %in% c('Jun', 'Jul', 'Aug')) %>%
+  ggplot(., aes(x = date, y = dWL)) + 
+  geom_point(aes(color = color.code), size = 3) +
+  geom_smooth(se = T, method = 'lm') +
+  scale_color_identity() +
+  labs(y = 'Wavelenght (nm)', x = 'Year', title = 'Summer (JJA) Lake Color Over Time') +
+  theme_bw() +
+  theme(legend.position = 'none')
+```
+
+### Now lets apply our model and look at clarity and some of it's key dynamics.  Note the points below are still colored by their dominant wavelength allowing us to see how lake color changes with predicted clarity.
+
+```{r}
+Mendota <- Mendota %>%
+  rename_at(vars(Blue, Green, Red, Nir, Swir1, Swir2), tolower) %>%
+  mutate(dWL = fui.hue(red, green, blue),
+         NR = nir/red,
+         ndvi = (nir-red)/(nir+red),
+         gndvi = (nir-green)/(nir + green),
+         ndti = (red-green)/(red + green)) %>%
+  left_join(fui.lookup)
+
+Mendota$sdd <- predict(xgb.naive, as.matrix(Mendota[,feats]))
+
+# Monthly Climatology
+ggplot(Mendota, aes(x = month, y = sdd)) + 
+  #geom_violin(draw_quantiles = .5) +
+  geom_boxplot(outlier.colour = 'transparent') +
+  geom_jitter(aes(color = color.code), size = 2, position = position_jitter(.2)) +
+  scale_color_identity() +
+  labs(y = 'Predicted Water Clarity (m)', title = 'Monthly Climatology') +
+  theme_bw() +
+  theme(legend.position = 'none')
+
+# Summer color observations over time
+Mendota %>%
+  filter(month %in% c('Jun', 'Jul', 'Aug')) %>%
+  ggplot(., aes(x = date, y = sdd)) + 
+  geom_point(aes(color = color.code), size = 3) +
+  geom_smooth(se = T, method = 'lm') +
+  scale_color_identity() +
+  labs(y = 'Clarity (m)', x = 'Year', title = 'Summer (JJA) Lake Color Over Time') +
+  theme_bw() +
+  theme(legend.position = 'none')
+```
+
+
+
+# That's the gist of it! Now go do some cool remote sensing work!
+
+If you have any questions feel free to reach out at sntopp@live.unc.edu
+![](https://media.giphy.com/media/3oEhn6803hZKJNeMhy/giphy.gif)
+
+### Bonus: Model Explainability
+
+#### Now lets look at some interpretability metrics, specifically SHAP values and feature importance.
+
+SHAP values show the distribution of feature effects across all observations. A more detailed description can be found at https://christophm.github.io/interpretable-ml-book/shap.html
+
+```{r}
+xgb.plot.shap(data = as.matrix(as.munged[,feats]), top_n = 6, n_col = 3, model = xgb.naive) 
+```
+
+
+ALE plots describe the average influence of a predictor on the final prediction along a localized window of values.  These plots are simple to interpret, fast to calculate, and aren't impacted by collinearity in the predictor space.  If the ALE value is above zero, it means the feature has a positive impace on model predictions at the given value along the x-axis. If it's below 0, it has a negative impact. 
 
 For a summary of ALE plots, see https://christophm.github.io/interpretable-ml-book/ale.html.
 
-## Now lets look at some interpretability metrics, first feature importance and Accumulated Local Effects (ALE) plots
-
-Here, feature importance is permutation feature importance, or the increase in error when the values of a predictor are randomly shuffled (i.e. when we add significant noise to a given predictor).  
 
 ```{r}
 import <- xgb.importance(feats, xgb.naive)
@@ -119,77 +264,4 @@ These are similar to the results that Xiao has presented, except that they're ba
 ```{r}
 tree <- iml::TreeSurrogate$new(predictor, maxdepth = 2)
 plot(tree$tree)
-```
-
-### Finally, we'll look at SHAP (Shapely Additive exPlanations).
-These are similar to ALE plots, but show the distribution of feature effects across all observations instead of just averaged across a small window.  Additionally, they can tell us the feature contributions to any *individual* prediction.  The methods are a little more complicated, but a simplified explanation is that SHAP builds iterative local models at each of our observations. For more info, see https://christophm.github.io/interpretable-ml-book/shap.html
-
-First: we'll look at overall SHAP results for our nine most important features. For SHAP, importance is calculated as those predictors that have the highest cumulative impact across the local models.
-
-```{r}
-xgb.plot.shap(data = as.matrix(as.munged[,feats]), top_n = 6, n_col = 3, model = xgb.naive) 
-```
-
-Then, we'll look at the SHAP summary plot for all predictors. Here, features are ordered by their SHAP importance. Each point on the summary plot is a Shapley value for a feature in one of our observations. The x-axis is it's Shapley value (it's contribution to the model prediction). The color represents the relative value of the feature from low to high.
-
-```{r}
-library(SHAPforxgboost)
-shap_long <- shap.prep(xgb_model = xgb.naive, X_train = as.matrix(train[,feats]))
-shap.plot.summary(shap_long)
-```
-
-With SHAP, we can take any individual observation and see how each input feature contributes to the final prediction as shown below for the first observation in our training dataset. Phi, along the x axis, denotes the impact of each feature to the final prediction. This allows us to look at any individual lake and see how our model is predicting its color.
-
-```{r}
-shap <- Shapley$new(predictor, x.interest = train[,feats][1,])
-plot(shap)
-
-shap$results
-
-shapper <- function(i, ID){
-  shap <- Shapley$new(predictor, x.interest = train[,feats][i,])
-  
-  shap$results %>% filter(feature %in% c('spring_temperature_mean',
-                                 'spring_total_precipitation_mean',
-                                 'depthMean')) %>%
-    mutate(id = ID)
-  # tibble(id = ID, 
-  #        temp_shap = shap$results$phi[shap$results$feature == 'spring_temperature_mean'], 
-  #        precip_shap = shap$results$phi[shap$results$feature == 'spring_total_precipitation_mean'],
-  #        depth_shap = shap$results$phi[shap$results$feature == 'depthMean']
-  #        )
-}
-
-library(furrr)
-sample <- c(1:nrow(train)) %>% sample(5000)
-plan(multiprocess)
-shapperOut = future_map2_dfr(sample, train$id[sample], shapper, .progress = T, .options = future_options(packages = c('xgboost', 'iml')))
-
-plan(sequential)
-
-
-shapperOut = map2_dfr(c(1:nrow(train)), train$id, shapper)
-
-world <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
-
-shapper.sf <- shapperOut %>% left_join(train %>% dplyr::select(id, lat, lon)) %>%
-  st_as_sf(coords = c('lon','lat'), crs = 4326)
-
-feature =  "spring_total_precipitation_mean"
-hist(shapperOut$phi[shapperOut$feature == feature])
-
-shapper.sf %>%
-  mutate(phi = ifelse(phi < -20,-20, 
-                      ifelse(phi >15,15,phi))) %>%
-  ggplot() +
-  geom_sf(data = world) +
-  geom_sf(aes(color = phi), size = .5) +
-  #scale_color_viridis_c('Model Impact') +
-  scale_color_gradient2('Model Impact', low = 'blue', mid = 'grey80', high = 'red') +
-  theme(legend.position = 'bottom') +
-  facet_wrap(~feature, ncol = 1)
-
-
-
-shapperOut = map2_dfr(c(1:10), train$id[1:10], shapper)
 ```
