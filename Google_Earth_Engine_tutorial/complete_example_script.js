@@ -10,29 +10,47 @@
 // tour of the interface
 // ******************************************************************************** //
 
-// "Feature tour" function from Google Earth Engine
+// use "Feature tour" function from Google Earth Engine
+
+
+
+
+
+
+
+
+
 
 // ******************************************************************************** //
 // WORKING WITH OPTICAL REMOTE SENISNG DATA
+// 1. narrow down to images according to location, time, and cloudiness
+// 2. mask unwanted pixels
+// 3. mapping images
 // ******************************************************************************** //
+
+
 // data import (using the search bar, pick the collection, and import)
 var landsat8 = ee.ImageCollection("LANDSAT/LC08/C01/T1_SR");
 var point = ee.Geometry.Point([-112.6674, 41.2205]);
 
+// a typical image object contains a list of bands and a dictionary of properties
 print(landsat8.first()); // ee.Image consists of bands and properties
 
+// example of how to narrow down to the area of interest and to do a preliminary screen of cloudiness
 landsat8 = landsat8
-.filterMetadata('CLOUD_COVER', 'less_than', 30)
-.filterBounds(point);
+.filterBounds(point)
+.filterMetadata('CLOUD_COVER', 'less_than', 30);
 
 var img = ee.Image(landsat8.first());
 
+// let plot the image on the map using its red, green, and blue band
 Map.addLayer(img, {bands: ['B4', 'B3', 'B2'], min: 0, max: 10000, gamma: 1.2}, 'rgb example', false);
 
 // cloud and cloud shadow (make use the example cloud-masking scripts in the "Examples" repo)
 // snow/ice (masking snow/ice in addition to clouds)
 
 // Function to cloud mask from the pixel_qa band of Landsat 8 SR data.
+// a mask is often a binary image that's used to remove unwanted pixels from a data layer
 function maskL8sr(image) {
   // Bits 3 and 5 are cloud shadow and cloud, respectively.
   var cloudShadowBitMask = 1 << 3;
@@ -87,10 +105,29 @@ imgMasked = CalcHillShadowSR(imgMasked);// output 1 means surface illuminated.
 Map.addLayer(imgMasked, {bands:['hillshadow'], min: 0, max: 1}, 'terrainShadow', false);
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
 // ******************************************************************************** //
-// EXAMPLE SCENARIO 1: reflectance time series over a sample location (color)
+// EXAMPLE: color time series over a sample location
+// 1. narrow down images according
+// 2. remove unwanted pixels for all the images using .map()
+// 3. calculate water color using .map()
+// 4. map and visualize time series of water color using ui.Chart
 // ******************************************************************************** //
 
+// based on this publication https://www.mdpi.com/2072-4292/10/8/1273
+// Lehmann, M. K., Nguyen, U., Allan, M., & Van der Woerd, H. J. (2018). Colour classification of 1486 lakes across a wide range of optical water types. Remote Sensing, 10(8), 1273.
 var rgb2wavelengthLehmann = function(img, rgbNames) {
 
   rgbNames = ee.List(rgbNames);
@@ -133,6 +170,9 @@ var rgb2wavelengthLehmann = function(img, rgbNames) {
 
   return(alpha.interpolate(xRef, yRef, "mask").rename('dwLehmann').addBands(s));
 };
+
+// Forel-Ule color scale
+// https://www.eyeonwater.org/education/water-colour
 var colorVis = {
       min: 471,
       max: 600,
@@ -142,6 +182,8 @@ var colorVis = {
 var landsat8 = ee.ImageCollection("LANDSAT/LC08/C01/T1_SR");
 
 print(landsat8.first()); // ee.Image consists of bands and properties
+
+var poi = /* color: #ffc82d */ee.Geometry.Point([-112.6664899559139, 41.215474795410564]);
 
 landsat8 = landsat8
 .filterMetadata('CLOUD_COVER', 'less_than', 30)
