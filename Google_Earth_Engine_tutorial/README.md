@@ -3,7 +3,7 @@ The script in this folder with the name "complete_example_script.js" or can be a
 
 # Goal
 
-* brief understanding of how GEE works through live coding hands on
+High level understanding of how GEE works through a live coding session
 
 ## will cover
 1. GEE data types common in geospatial/remote sensing studies
