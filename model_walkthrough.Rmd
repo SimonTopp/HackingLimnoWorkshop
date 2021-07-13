@@ -20,9 +20,9 @@ library(lubridate)
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 ```
 
-### First lets load in AquaSat (available at <https://figshare.com/articles/dataset/AquaSat/8139383>).  
+### First lets load in AquaSat (available at <https://figshare.com/articles/dataset/AquaSat/8139383>).
 
-It's important to know that AquaSat takes a very *inclusive* approach to data availability.  This is in order to give end users more control over the various filtering choices they want to make.  However, it also means that we need to be careful and apply some reasonable data quality control measures. That's what we'll do in this first chunk. Future version's of AquaSat will have tiered data, basically a flag that does this step for you.
+It's important to know that AquaSat takes a very *inclusive* approach to data availability. This is in order to give end users more control over the various filtering choices they want to make. However, it also means that we need to be careful and apply some reasonable data quality control measures. That's what we'll do in this first chunk. Future version's of AquaSat will have tiered data, basically a flag that does this step for you.
 
 Additionally, we'll add some band ratios that we know will be helpful in our modelling efforts.
 
@@ -56,7 +56,7 @@ as.munged <- as %>%
 
 ### Build a model to predict water clarity.
 
-Now we're going to use AquaSat to build a model for predicting water clarity in lakes. Here, we're going to build what I'll refer to as a *naive* model.  By naive I am referring to the fact that it's a proof of concept model and there are a number of steps we could take to improve it's performance and generalizability.  We'll discuss some of these below.
+Now we're going to use AquaSat to build a model for predicting water clarity in lakes. Here, we're going to build what I'll refer to as a *naive* model. By naive I am referring to the fact that it's a proof of concept model and there are a number of steps we could take to improve it's performance and generalizability. We'll discuss some of these below.
 
 ```{r}
 
@@ -97,28 +97,36 @@ preds %>%
             smape = smape(secchi, predicted)) %>% 
   kable(digits = 3) %>% kable_styling()
 ```
-#### So, using purely optical inputs, we still get an R^2 of ~.5 and MAE of `r round(xgb.naive$best_score, 3)` meters. Not bad!
+
+#### So, using purely optical inputs, we still get an R\^2 of \~.5 and MAE of `r round(xgb.naive$best_score, 3)` meters. Not bad!
+
 #### If we wanted to maximize this models predictive capability we could:
-- Add in lake and landscape variables (depth, surface area, land cover, etc)
-- Apply some minor standardization procedures across our landsat sensors
-- Hypertune our model to optimize performance.
+
+-   Add in lake and landscape variables (depth, surface area, land cover, etc)
+-   Apply some minor standardization procedures across our landsat sensors
+-   Hypertune our model to optimize performance.
 
 #### If we wanted to maximize the generalizability of our model we could:
-- Apply leave-location-leave time out cross-validation
-- Be more intential in terms of our train/test splits
-- Apply model weights to focus on data sparse regions
 
-### Now lets actually apply our model to a lake to explore it's clarity dynamics.  
-Here, were going to use lake Mendota as an example, but the map below shows all the lakes that are in LimnoSat-US.
+-   Apply leave-location-leave time out cross-validation
+-   Be more intential in terms of our train/test splits
+-   Apply model weights to focus on data sparse regions
+
+### Now lets actually apply our model to a lake to explore it's clarity dynamics.
+
+Here, were going to use lake Mendota as an example, but the map below shows all the lakes that are in [LimnoSat-US](https://doi.org/10.5281/zenodo.4139694).
 
 ```{r}
+## This chunk requires the LimnoSat database available at 
+# https://doi.org/10.5281/zenodo.4139694. It is not necessary for the workshop itself.
+
 ## Read in the data
 # Lakes
 lakes <- st_read('../Walkthroughs/data/LimnoSat/HydroLakes_DP.shp') %>%
   st_centroid()
 
 #LimnoSat
-ls <- read_feather('../Walkthroughs/data/LimnoSat/LimnoSat_20200628.feather')
+#ls <- read_feather('../Walkthroughs/data/LimnoSat/LimnoSat_20200628.feather')
 
 #Find your lake of interest, click on the a lake to get it's Hylak_id
 leaflet() %>%
@@ -183,7 +191,7 @@ Mendota %>%
   theme(legend.position = 'none')
 ```
 
-### Now lets apply our model and look at clarity and some of it's key dynamics.  Note the points below are still colored by their dominant wavelength allowing us to see how lake color changes with predicted clarity.
+### Now lets apply our model and look at clarity and some of it's key dynamics. Note the points below are still colored by their dominant wavelength allowing us to see how lake color changes with predicted clarity.
 
 ```{r}
 Mendota <- Mendota %>%
@@ -219,28 +227,23 @@ Mendota %>%
   theme(legend.position = 'none')
 ```
 
-
-
 # That's the gist of it! Now go do some cool remote sensing work!
 
-If you have any questions feel free to reach out at sntopp@live.unc.edu
-![](https://media.giphy.com/media/3oEhn6803hZKJNeMhy/giphy.gif)
+If you have any questions feel free to reach out at [sntopp\@live.unc.edu](mailto:sntopp@live.unc.edu){.email} ![](https://media.giphy.com/media/3oEhn6803hZKJNeMhy/giphy.gif)
 
 ### Bonus: Model Explainability
 
 #### Now lets look at some interpretability metrics, specifically SHAP values and feature importance.
 
-SHAP values show the distribution of feature effects across all observations. A more detailed description can be found at https://christophm.github.io/interpretable-ml-book/shap.html
+SHAP values show the distribution of feature effects across all observations. A more detailed description can be found at <https://christophm.github.io/interpretable-ml-book/shap.html>
 
 ```{r}
 xgb.plot.shap(data = as.matrix(as.munged[,feats]), top_n = 6, n_col = 3, model = xgb.naive) 
 ```
 
+ALE plots describe the average influence of a predictor on the final prediction along a localized window of values. These plots are simple to interpret, fast to calculate, and aren't impacted by collinearity in the predictor space. If the ALE value is above zero, it means the feature has a positive impace on model predictions at the given value along the x-axis. If it's below 0, it has a negative impact.
 
-ALE plots describe the average influence of a predictor on the final prediction along a localized window of values.  These plots are simple to interpret, fast to calculate, and aren't impacted by collinearity in the predictor space.  If the ALE value is above zero, it means the feature has a positive impace on model predictions at the given value along the x-axis. If it's below 0, it has a negative impact. 
-
-For a summary of ALE plots, see https://christophm.github.io/interpretable-ml-book/ale.html.
-
+For a summary of ALE plots, see <https://christophm.github.io/interpretable-ml-book/ale.html>.
 
 ```{r}
 import <- xgb.importance(feats, xgb.naive)
@@ -259,7 +262,8 @@ plot(effs)
 ```
 
 ### Surrogate Trees can help us identify what variable splits and thresholds might be most important.
-These are similar to the results that Xiao has presented, except that they're based on the *predictions* of our machine learning model and not the actual *observed* values in our dataset.  This means that it's telling us important splits/thresholds in the model itself. Here I limit them to a depth of 2, but this is adjustable. 
+
+These are similar to the results that Xiao has presented, except that they're based on the *predictions* of our machine learning model and not the actual *observed* values in our dataset. This means that it's telling us important splits/thresholds in the model itself. Here I limit them to a depth of 2, but this is adjustable.
 
 ```{r}
 tree <- iml::TreeSurrogate$new(predictor, maxdepth = 2)
