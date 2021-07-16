@@ -238,34 +238,8 @@ If you have any questions feel free to reach out at [sntopp\@live.unc.edu](mailt
 SHAP values show the distribution of feature effects across all observations. A more detailed description can be found at <https://christophm.github.io/interpretable-ml-book/shap.html>
 
 ```{r}
-xgb.plot.shap(data = as.matrix(as.munged[,feats]), top_n = 6, n_col = 3, model = xgb.naive) 
-```
-
-ALE plots describe the average influence of a predictor on the final prediction along a localized window of values. These plots are simple to interpret, fast to calculate, and aren't impacted by collinearity in the predictor space. If the ALE value is above zero, it means the feature has a positive impace on model predictions at the given value along the x-axis. If it's below 0, it has a negative impact.
-
-For a summary of ALE plots, see <https://christophm.github.io/interpretable-ml-book/ale.html>.
-
-```{r}
 import <- xgb.importance(feats, xgb.naive)
 xgb.plot.importance(import)
 
-pred <- function(model, newdata){
-  predict(model, xgb.DMatrix(as.matrix(newdata)))
-}
-
-predictor <- iml::Predictor$new(xgb.naive, data = as.munged[,feats], y = as.munged[,target][[1]], predict.function = pred)
-
-featureImp <- iml::FeatureImp$new(predictor, loss = 'mse')
-plot(featureImp)
-effs <- iml::FeatureEffects$new(predictor)
-plot(effs)
-```
-
-### Surrogate Trees can help us identify what variable splits and thresholds might be most important.
-
-These are similar to the results that Xiao has presented, except that they're based on the *predictions* of our machine learning model and not the actual *observed* values in our dataset. This means that it's telling us important splits/thresholds in the model itself. Here I limit them to a depth of 2, but this is adjustable.
-
-```{r}
-tree <- iml::TreeSurrogate$new(predictor, maxdepth = 2)
-plot(tree$tree)
+xgb.plot.shap(data = as.matrix(as.munged[,feats]), top_n = 6, n_col = 3, model = xgb.naive) 
 ```
